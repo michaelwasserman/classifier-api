@@ -20,9 +20,9 @@ Today, developers face an unappealing trade-off:
 
 Recent machine learning advances demonstrate that giving up open-ended string generation unlocks massive gains in speed, reliability, and efficiency. This is exemplified by "System One" decision models (such as [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev), [Kev](https://github.com/jaredpalmer/kev), [Laya](https://github.com/NandhaKishorM/laya), and [Open-Jev](https://github.com/nico-martin/open-jev)) and discrete diffusion / parallel canvas decoding architectures:
 
-- **Parallel, Single-Pass Execution:** Instead of generating text token-by-token, these architectures evaluate an input state against multiple independent questions and option sets in **a single forward pass**—either via a bidirectional encoder with a learned decision head (e.g., ModernBERT + RLCD decision head) or via a 1-step bidirectional diffusion read over a fixed-width decision slot canvas.
+- **Parallel, Single-Pass Execution:** Instead of generating text token-by-token, these architectures evaluate an input state against multiple independent questions and option sets in **a single forward pass**—either via a bidirectional encoder with a learned decision head or via a 1-step bidirectional diffusion read over designated decision slots.
 - **Zero Hallucinations & Guaranteed Type Safety:** Because the runtime scores caller-supplied options directly at designated decision slots rather than generating unconstrained characters, it **cannot hallucinate out-of-schema values or syntax errors**.
-- **Calibrated Probabilities & Epistemic Uncertainty:** Using Reinforcement Learning for Calibrated Decisions (RLCD), temperature scaling, and optional entropy-gated multi-draw canvas sampling, every decision includes a calibrated probability distribution, expected ordinal score ($E[S]$), standard error, and confidence/agreement metrics—enabling software to branch reliably ("smart `if`-statements") and defer to users when uncertain.
+- **Calibrated Probabilities & Confidence:** Using Reinforcement Learning for Calibrated Decisions (RLCD) and post-hoc calibration, every decision includes a calibrated probability distribution, expected ordinal score ($E[S]$), and confidence score—enabling software to branch reliably when confident, and defer when uncertain.
 - **Tiny On-Device Footprint:** Compact models (300M–800M parameters, ~300–400 MB quantized) achieve high accuracy on decision tasks in 10–50 milliseconds, making them viable across a broad spectrum of consumer CPUs, GPUs, and NPUs.
 
 ---
@@ -62,11 +62,11 @@ This paradigm unifies eight foundational decision primitives under three questio
 ## 3. Prospective Developer Pattern
 
 We are exploring a declarative, **three-step developer pattern** on `window.Classifier` (exposed in `Window` and `Worker` contexts):
-1. **Define a question schema** (`context` plus an array of `questions` using `binary`/`boolean`, `categorical`/`choice`, or `ordinal`/`score` modalities) and initialize a session via `Classifier.create(schema)`.
-2. **Pass the input state** (`DOMString` text, serialized DOM state, or JSON, plus optional per-call `context` or `samples`) to `classifier.classify(input, options)`.
-3. **Execute in parallel** and receive calibrated `decisions` (probabilities, top labels, expected scores, confidence, and uncertainty metrics) in a single result.
+1. **Define a question schema** (`context` plus `questions` using `binary`/`boolean`, `categorical`/`choice`, or `ordinal`/`score` modalities) and initialize a session via `Classifier.create(schema)`.
+2. **Pass the input state** (`DOMString` text, serialized DOM state, or JSON, plus optional per-call `context`) to `classifier.classify(input, options)`.
+3. **Execute in parallel** and receive a calibrated result object mapping each question `id` to its decision (probabilities, top label, expected score, and confidence).
 
-### Example 1: Parallel Triage, Scoring, and Verification
+### Example 1: Parallel Triage, Scoring, and Verification (Cohesive Result Object)
 
 ```js
 // 1. Define the structured question schema
@@ -113,60 +113,53 @@ if (status === "available" || status === "downloadable") {
   const input = document.querySelector("#ticket-input").value;
   // e.g., "Urgent: our production database pipeline crashes with a fatal segfault!"
 
-  // 3. Execute in a single parallel pass and inspect calibrated decisions
+  // 3. Execute in a single parallel pass and inspect the cohesive result object
   const result = await classifier.classify(input);
-  // result.drawsExecuted -> 1 (or up to maxSamples when adaptive entropy sampling triggers)
 
-  const [urgent, category, severity] = result.decisions;
-
-  console.log(urgent);
+  console.log(result);
   // {
-  //   id: "is_urgent",
-  //   label: "true",
-  //   probability: 0.97, // Calibrated P(true)
-  //   confidence: 0.94,
-  //   probabilities: [{ label: "true", probability: 0.97 }, { label: "false", probability: 0.03 }]
-  // }
-
-  console.log(category);
-  // {
-  //   id: "category",
-  //   label: "bug",
-  //   confidence: 0.92,
-  //   probabilities: [
-  //     { label: "bug", probability: 0.94 },
-  //     { label: "billing", probability: 0.03 },
-  //     { label: "feature_request", probability: 0.03 }
-  //   ]
-  // }
-
-  console.log(severity);
-  // {
-  //   id: "severity",
-  //   label: "5",
-  //   expectedScore: 4.78, // Continuous E[S] = sum(level_i * p_i)
-  //   standardError: 0.12,
-  //   confidence: 0.89,
-  //   probabilities: [...]
+  //   is_urgent: {
+  //     id: "is_urgent",
+  //     label: "true",
+  //     probability: 0.97, // Calibrated P(true)
+  //     confidence: 0.94,
+  //     probabilities: [{ label: "true", probability: 0.97 }, { label: "false", probability: 0.03 }]
+  //   },
+  //   category: {
+  //     id: "category",
+  //     label: "bug",
+  //     confidence: 0.92,
+  //     probabilities: [
+  //       { label: "bug", probability: 0.94 },
+  //       { label: "billing", probability: 0.03 },
+  //       { label: "feature_request", probability: 0.03 }
+  //     ]
+  //   },
+  //   severity: {
+  //     id: "severity",
+  //     label: "5",
+  //     expectedScore: 4.78, // Continuous E[S] = sum(level_i * p_i)
+  //     confidence: 0.89,
+  //     probabilities: [...]
+  //   }
   // }
 
   // Act autonomously when confident; fall back to human choice when ambiguous
-  if (category.confidence > 0.85) {
-    routeTicket(category.label, severity.expectedScore);
+  if (result.category.confidence > 0.85) {
+    routeTicket(result.category.label, result.severity.expectedScore);
   } else {
-    renderDepartmentPicker(category.probabilities);
+    renderDepartmentPicker(result.category.probabilities);
   }
 
   classifier.destroy();
 }
 ```
 
-### Example 2: Client-Side Action Matching & Adaptive Sampling
+### Example 2: Client-Side Action Matching (Direct Destructuring by Question ID)
 
 ```js
 const actionMatcher = await Classifier.create({
   context: "Document editor command palette",
-  maxSamples: 4, // Allow up to 4 parallel diffusion canvas draws if entropy is high
   questions: [
     {
       id: "command",
@@ -181,13 +174,9 @@ const actionMatcher = await Classifier.create({
   ]
 });
 
-// When `samples` is omitted (or 0), the runtime executes 1 pass and only runs
-// additional seeded draws if the initial probability distribution has high Shannon entropy.
-const { decisions, drawsExecuted } = await actionMatcher.classify(
-  "let my coworkers view this file",
-  { samples: 0 }
-);
-// decisions[0].label -> "share_link" (confidence: 0.93, agreement: 1.0, drawsExecuted: 1)
+// Because the result object is keyed by question `id`, callers can destructure directly:
+const { command } = await actionMatcher.classify("let my coworkers view this file");
+// command -> { id: "command", label: "share_link", confidence: 0.93, probabilities: [...] }
 ```
 
 ---
@@ -197,13 +186,13 @@ const { decisions, drawsExecuted } = await actionMatcher.classify(
 To make on-device decision models dependable primitives for web software, the API and underlying browser runtime must address key functional and operational constraints:
 
 - **Strict Output Conformance:** The API must never throw syntax parsing errors or return hallucinated out-of-vocabulary strings. Every `categorical`/`choice` decision `label` is strictly one of the caller's `options`; every `binary`/`boolean` or `ordinal`/`score` outputs bounded probabilities (`[0.0, 1.0]`) and well-defined expected values (`expectedScore`).
-- **Calibrated Confidence & Epistemic Uncertainty:** Raw neural network logits are frequently overconfident. Runtimes must apply calibration—such as sequence-bucketed RLCD temperature scaling on encoder decision heads (`LayaModelExecutor`), or multi-draw variance (`standardError` and inter-draw `agreement`) across seeded diffusion canvases (`JevSchemaCompiler`)—so that probabilities and `confidence` scores reliably reflect true certainty.
-- **Single-Pass Parallelism & Question Isolation:** Multiple questions evaluated over the same input state share the encoded state representation while remaining isolated from each other (e.g., via fixed-width padded slot canvases `canvasWidth` or masked decision tokens). Packing 5 questions into a schema evaluates in a single pass rather than 5 sequential model invocations.
+- **Calibrated Confidence:** Raw neural network logits are frequently overconfident. Runtimes must apply calibration (such as sequence-bucketed RLCD temperature scaling or multi-pass variance estimation) so that returned `probabilities` and `confidence` scores reliably reflect true certainty.
+- **Single-Pass Parallelism & Question Isolation:** Multiple questions evaluated over the same input state share the encoded state representation while remaining isolated from each other. Packing multiple questions into a schema evaluates in a single pass rather than sequential model invocations.
 - **Taxonomy Limits & Option Cardinality:**
-  - *Option Count & Slot Capacity:* Single-pass encoder heads and single-token diffusion canvases typically bound option cardinality per question (e.g., 2–16 options in compact LiteRT heads or up to 26–255 single-token labels in larger backbones) and total questions per canvas (`canvasWidth` of 16–64 tokens). Higher-cardinality ranking tasks can compose independent `score` evaluations or two-stage filtering.
-  - *Distinctiveness & Ambiguity:* When caller-defined options overlap (e.g., `"fees"` vs. `"billing"`), lack sufficient `description` detail, or are tangential to the input, calibrated models spread probability mass across plausible options (yielding higher Shannon entropy and lower `confidence`). On diffusion backends, high slot entropy ($H > \tau$) can automatically trigger additional seeded noise draws (`maxSamples`) to measure epistemic stability (`agreement`).
-  - *Order Invariance:* Training with option permutations and single-token slot readouts minimizes positional bias across option orderings.
-- **Input Length & Context Bounds:** On-device encoders and diffusion backbones have bounded context windows (e.g., 64–1,024 tokens for ultra-fast LiteRT/ModernBERT checkpoints up to 8,192 tokens for Qwen/Gemma backbones). The API should handle shared `context` and `input` bounds predictably.
+  - *Option Count & Capacity:* Single-pass decision heads and diffusion canvases bound option cardinality per question (e.g., 2–16 options in compact heads or up to 26–255 options in larger backbones) and total questions per schema. Higher-cardinality ranking tasks can compose independent `score` evaluations or two-stage filtering.
+  - *Distinctiveness & Ambiguity:* When caller-defined options overlap (e.g., `"fees"` vs. `"billing"`), lack sufficient `description` detail, or are tangential to the input, calibrated models spread probability mass across plausible options—yielding higher entropy and lower `confidence`.
+  - *Order Invariance:* Training with option permutations and isolated slot readouts minimizes positional bias across option orderings.
+- **Input Length & Context Bounds:** On-device encoders and diffusion backbones have bounded context windows (e.g., 64–1,024 tokens for ultra-fast checkpoints up to 8,192 tokens for larger backbones). The API should handle shared `context` and `input` bounds predictably.
 - **Multi-Language Support:** Web content spans hundreds of languages and scripts. An English-only encoder can fail with dangerously high confidence on non-Latin scripts. The browser runtime must either pair a multilingual encoder (such as `mmBERT`) or route across language-appropriate checkpoints based on fast script/language detection.
 
 ---
@@ -213,7 +202,9 @@ To make on-device decision models dependable primitives for web software, the AP
 We invite community feedback on several open design questions:
 
 1. **Standardized vs. Client-Defined Taxonomies:** Alongside custom developer-defined `questions` schemas, should `Classifier.create()` also accept shorthand identifiers for standardized, interoperable web taxonomies (e.g., `taxonomy: "iab-v3.1"`) that return stable taxonomy IDs?
-2. **Unified Runtime Abstraction (Encoder Decision Heads vs. Diffusion Canvases):** Our experimental prototypes demonstrate that `window.Classifier` can be backed by both **bidirectional encoders with RLCD decision heads** (e.g., Laya / ModernBERT via LiteRT or SafeTensors) and **1-step bidirectional diffusion canvas reads** (e.g., DiffusionGemma via `JevSchemaCompiler`). Which execution controls (such as `maxSamples`, `samples`, or `canvasWidth`) should be high-level hints versus internal runtime optimizations?
+2. **Result Ergonomics, Additive Confidence Diagnostics & Uncertainty Controls:**
+   - *Keyed Record vs. Positional Array / Wrapper:* Having `classify()` resolve to a `record<DOMString, ClassifierDecision>` keyed by question `id` allows developers to either hold all decisions in a single cohesive `result` object (`result.category.label`) or destructure by name (`const { command } = await classifier.classify(...)`). Alternative shapes under consideration include also accepting `questions` as a keyed object in `Classifier.create()`, returning a positional `sequence<ClassifierDecision>` array, or returning a wrapper dictionary (`{ decisions }`) if top-level call metadata is needed.
+   - *Additive Confidence & Sampling Controls:* The baseline API shape intentionally starts minimal, returning `probabilities`, `label`, `expectedScore`, and `confidence` on each `ClassifierDecision`. Because both input options (`ClassifierCreateOptions`, `ClassifierClassifyOptions`) and per-question decisions (`ClassifierDecision`) are extensible WebIDL dictionaries, richer uncertainty controls and diagnostics can be layered on as **strictly additive, non-breaking enhancements** if warranted. Should implementation-specific diffusion sampling controls and metrics (such as `maxSamples` / `samples`, `canvasWidth`, `drawsExecuted`, `agreement`, or `standardError`) be exposed as optional dictionary members for advanced callers, or kept internal in favor of model-agnostic effort hints (`classify(input, { effort })`) and uncertainty fields?
 3. **Batching States (`classifyBatch`):** Evaluating *many questions over one input* is naturally parallelized in a single pass. For ranking or filtering *many inputs against one schema* (e.g., scoring 50 feed items or tabs), should `Classifier` expose a first-class `classifyBatch(inputs)` method?
 4. **Multi-Modal Inputs (Image, Audio, DOM):** Could `classify()` eventually accept `ImageBitmap`, `HTMLCanvasElement`, or `AudioBuffer` inputs alongside text (e.g., classifying image accessibility traits, verifying visual UI state, or detecting spoken intent)?
 
@@ -233,8 +224,8 @@ We invite community feedback on several open design questions:
 ## Appendix B: Security, Privacy, Accessibility, i18n & Ecosystem Considerations
 
 - **Privacy & Data Sovereignty:** All inference executes locally on the user's device. The API is strictly **stateless**: inputs are never transmitted over the network, stored on disk, or used to update model weights across calls. Access is gated by `SecureContext` and the `classifier` Permissions Policy (`PermissionsPolicyFeature::kClassifier`, defaulting to `Self`).
-- **Security & Injection Resistance:** User-supplied `input` text is strictly separated from developer-supplied `questions` and `options` during schema compilation (`JevSchemaCompiler` / `LayaModelExecutor`), preventing untrusted input from injecting fake options or corrupting adjacent decision slots. Hardware timing and floating-point precision variations must be bounded to prevent device fingerprinting.
-- **Accessibility (a11y):** Fast local classification enables cognitive accessibility tools—such as automated tab grouping, reading-level estimation, and real-time form guidance—while calibrated `confidence` and `agreement` metrics allow UIs to avoid jarring automatic actions when user intent is uncertain.
+- **Security & Injection Resistance:** User-supplied `input` text is strictly separated from developer-supplied `questions` and `options` during schema compilation, preventing untrusted input from injecting fake options or corrupting adjacent decision slots. Hardware timing and floating-point precision variations must be bounded to prevent device fingerprinting.
+- **Accessibility (a11y):** Fast local classification enables cognitive accessibility tools—such as automated tab grouping, reading-level estimation, and real-time form guidance—while calibrated `confidence` metrics allow UIs to avoid jarring automatic actions when user intent is uncertain.
 - **Internationalization (i18n):** Browsers must ensure equitable behavior across languages and scripts. If a language is unsupported by the active on-device checkpoint, the API must explicitly report unavailability (`Classifier.availability()`) or route to a multilingual checkpoint rather than returning uncalibrated guesses.
 - **Ecosystem Effects & Device Equitability:** Unlike 4B–8B generative LLMs that require high-end desktop GPUs, non-autoregressive decision architectures (such as 300M–420M ModernBERT/mmBERT with RLCD heads) run in tens of milliseconds via native CPU/NPU acceleration (LiteRT/XNNPACK/BLAS) and modest WebGPU hardware—bringing on-device AI to a wide global distribution of devices without exhausting RAM or battery.
 
