@@ -61,7 +61,7 @@ This paradigm unifies eight foundational decision primitives under three questio
 
 ## 3. Prospective Developer Pattern
 
-We are exploring a declarative, **three-step developer pattern** on `window.Classifier` (exposed in `Window` and `Worker` contexts):
+We are exploring a declarative, **three-step developer pattern** on `window.Classifier` (exposed in `Window` contexts):
 1. **Define a question schema** (`context` plus `questions` using `binary`/`boolean`, `categorical`/`choice`, or `ordinal`/`score` modalities) and initialize a session via `Classifier.create(schema)`.
 2. **Pass the input state** (`DOMString` text, serialized DOM state, or JSON, plus optional per-call `context`) to `classifier.classify(input, options)`.
 3. **Execute in parallel** and receive a calibrated result object mapping each question `id` to its decision (probabilities, top label, expected score, and confidence).
@@ -72,6 +72,7 @@ We are exploring a declarative, **three-step developer pattern** on `window.Clas
 // 1. Define the structured question schema
 const schema = {
   context: "Enterprise customer support ticket router.",
+  expectedInputs: [{ type: "text", languages: ["en"] }],
   questions: [
     {
       id: "is_urgent",
@@ -183,17 +184,19 @@ const { command } = await actionMatcher.classify("let my coworkers view this fil
 
 ## 4. User & API Client Requirements
 
-To make on-device decision models dependable primitives for web software, the API and underlying browser runtime must address key functional and operational constraints:
+To make on-device classification models dependable primitives for web software, the API and underlying browser runtime must address key functional and operational constraints:
 
 - **Strict Output Conformance:** The API must never throw syntax parsing errors or return hallucinated out-of-vocabulary strings. Every `categorical`/`choice` decision `label` is strictly one of the caller's `options`; every `binary`/`boolean` or `ordinal`/`score` outputs bounded probabilities (`[0.0, 1.0]`) and well-defined expected values (`expectedScore`).
-- **Calibrated Confidence:** Raw neural network logits are frequently overconfident. Runtimes must apply calibration (such as sequence-bucketed RLCD temperature scaling or multi-pass variance estimation) so that returned `probabilities` and `confidence` scores reliably reflect true certainty.
+- **Calibrated Confidence:** Raw neural network logits are frequently overconfident. Runtimes must apply calibration (such as sequence-bucketed RLCD temperature scaling or multi-pass variance estimation) so that returned `probabilities` and `confidence` scores reliably reflect a useful certainty signal.
 - **Single-Pass Parallelism & Question Isolation:** Multiple questions evaluated over the same input state share the encoded state representation while remaining isolated from each other. Packing multiple questions into a schema evaluates in a single pass rather than sequential model invocations.
-- **Taxonomy Limits & Option Cardinality:**
-  - *Option Count & Capacity:* Single-pass decision heads and diffusion canvases bound option cardinality per question (e.g., 2–16 options in compact heads or up to 26–255 options in larger backbones) and total questions per schema. Higher-cardinality ranking tasks can compose independent `score` evaluations or two-stage filtering.
-  - *Distinctiveness & Ambiguity:* When caller-defined options overlap (e.g., `"fees"` vs. `"billing"`), lack sufficient `description` detail, or are tangential to the input, calibrated models spread probability mass across plausible options—yielding higher entropy and lower `confidence`.
-  - *Order Invariance:* Training with option permutations and isolated slot readouts minimizes positional bias across option orderings.
-- **Input Length & Context Bounds:** On-device encoders and diffusion backbones have bounded context windows (e.g., 64–1,024 tokens for ultra-fast checkpoints up to 8,192 tokens for larger backbones). The API should handle shared `context` and `input` bounds predictably.
-- **Multi-Language Support:** Web content spans hundreds of languages and scripts. An English-only encoder can fail with dangerously high confidence on non-Latin scripts. The browser runtime must either pair a multilingual encoder (such as `mmBERT`) or route across language-appropriate checkpoints based on fast script/language detection.
+- **Question & Option Limits (Taxonomy Design):**
+  - *Number of Questions & Choices:* Because the model evaluates every question and option in a single pass, there are practical limits on how many questions fit in one schema and how many `options` each question can list (typically 2–16 options in compact models, or up to dozens in larger models). To pick from a much larger set (like hundreds of products), apps can narrow candidates down in stages or score items individually.
+  - *Clear, Distinct Options:* When options overlap in meaning (e.g., `"fees"` vs. `"billing"`), lack helpful `description` text, or don't match the input, a well-calibrated model splits its probabilities across the plausible choices and reports a lower `confidence` score rather than guessing blindly.
+  - *Order Independence:* Whether an option is listed first or last in the `options` array should not bias the model's scores.
+- **Input Length & Context Bounds (`contextWindow`, `contextUsage`, `measureContextUsage`):** On-device encoders and diffusion backbones have bounded token windows (e.g., 512–1,024 tokens for compact checkpoints up to 8,192 tokens for larger backbones). Consistent with the Prompt API (`LanguageModel`) and other built-in AI APIs, a `Classifier` session can expose its total `contextWindow`, its `contextUsage`, and a `measureContextUsage(input, options)` method so clients can inspect capacity at runtime:
+  - *Session Creation (`Classifier.create`):* Compiling the session's `context`, `questions`, and `options` consumes a fixed portion of the window, reflected by `classifier.contextUsage`. Because `Classifier` is stateless across calls (it does not accumulate chat history), `classifier.contextUsage` remains **static** for the lifetime of the session. If the schema itself exceeds `contextWindow`, `Classifier.create()` rejects with a `QuotaExceededError`.
+  - *Per-Call Evaluation (`classifier.classify`):* Each `classify(input, options)` call must fit within the remaining capacity (`classifier.contextWindow - classifier.contextUsage`). Clients can pre-check an input's footprint via `await classifier.measureContextUsage(input, options)` to chunk or trim long content; if `contextUsage + inputUsage > contextWindow`, `classify()` rejects with a `QuotaExceededError` rather than silently truncating text.
+- **Multi-Language & Modality Support (`expectedInputs`):** Consistent with the [Prompt API (`LanguageModel`)](https://github.com/webmachinelearning/prompt-api), `Classifier.availability()` and `Classifier.create()` accept `expectedInputs` (e.g., `expectedInputs: [{ type: "text", languages: ["en", "es", "ja"] }]`). Because an English-only encoder can fail with overconfident guesses on non-Latin scripts, declaring expected input languages and modalities upfront allows the browser runtime to verify capability coverage, select or download a suitable multilingual/multimodal checkpoint, or return `"unavailable"` when a requested language or input type is not supported.
 
 ---
 
@@ -201,12 +204,13 @@ To make on-device decision models dependable primitives for web software, the AP
 
 We invite community feedback on several open design questions:
 
-1. **Standardized vs. Client-Defined Taxonomies:** Alongside custom developer-defined `questions` schemas, should `Classifier.create()` also accept shorthand identifiers for standardized, interoperable web taxonomies (e.g., `taxonomy: "iab-v3.1"`) that return stable taxonomy IDs?
-2. **Result Ergonomics, Additive Confidence Diagnostics & Uncertainty Controls:**
+1. **Result Ergonomics, Additive Confidence Diagnostics & Uncertainty Controls:**
    - *Keyed Record vs. Positional Array / Wrapper:* Having `classify()` resolve to a `record<DOMString, ClassifierDecision>` keyed by question `id` allows developers to either hold all decisions in a single cohesive `result` object (`result.category.label`) or destructure by name (`const { command } = await classifier.classify(...)`). Alternative shapes under consideration include also accepting `questions` as a keyed object in `Classifier.create()`, returning a positional `sequence<ClassifierDecision>` array, or returning a wrapper dictionary (`{ decisions }`) if top-level call metadata is needed.
    - *Additive Confidence & Sampling Controls:* The baseline API shape intentionally starts minimal, returning `probabilities`, `label`, `expectedScore`, and `confidence` on each `ClassifierDecision`. Because both input options (`ClassifierCreateOptions`, `ClassifierClassifyOptions`) and per-question decisions (`ClassifierDecision`) are extensible WebIDL dictionaries, richer uncertainty controls and diagnostics can be layered on as **strictly additive, non-breaking enhancements** if warranted. Should implementation-specific diffusion sampling controls and metrics (such as `maxSamples` / `samples`, `canvasWidth`, `drawsExecuted`, `agreement`, or `standardError`) be exposed as optional dictionary members for advanced callers, or kept internal in favor of model-agnostic effort hints (`classify(input, { effort })`) and uncertainty fields?
-3. **Batching States (`classifyBatch`):** Evaluating *many questions over one input* is naturally parallelized in a single pass. For ranking or filtering *many inputs against one schema* (e.g., scoring 50 feed items or tabs), should `Classifier` expose a first-class `classifyBatch(inputs)` method?
-4. **Multi-Modal Inputs (Image, Audio, DOM):** Could `classify()` eventually accept `ImageBitmap`, `HTMLCanvasElement`, or `AudioBuffer` inputs alongside text (e.g., classifying image accessibility traits, verifying visual UI state, or detecting spoken intent)?
+2. **Batching States (`classifyBatch`):** Evaluating *many questions over one input* is naturally parallelized in a single pass. For ranking or filtering *many inputs against one schema* (e.g., scoring 50 feed items or tabs), should `Classifier` expose a first-class `classifyBatch(inputs)` method?
+3. **Multi-Modal `expectedInputs` vs. Simpler `expectedInputLanguages` / `expectedLanguage` Shorthand:** Adopting the Prompt API's `expectedInputs: [{ type: "text", languages: ["en"] }, { type: "image" }, { type: "audio" }]` shape prepares `Classifier` to accept `ImageBitmapSource` or `AudioBuffer` inputs alongside text without breaking session creation semantics. For common text-only classification tasks, should `Classifier.create()` and `Classifier.availability()` also accept a simpler `expectedInputLanguages: ["en"]` (as in `Summarizer` / `Writer`) or `expectedLanguage` shorthand option, or exclusively use `expectedInputs`?
+4. **Standardized vs. Client-Defined Taxonomies:** Alongside custom developer-defined `questions` schemas, should `Classifier.create()` also accept shorthand identifiers for standardized, interoperable web taxonomies (e.g., `taxonomy: "iab-v3.1"`) that return stable taxonomy IDs?
+5. **Worker Context Support & Permissions Policy:** Gating `Classifier` behind a `classifier` Permissions Policy (`PermissionsPolicyFeature::kClassifier`) currently restricts the API to `Window` contexts, because Permissions Policy is not yet defined for workers. How should `Classifier` support background worker contexts (e.g., `DedicatedWorker`, `SharedWorker`, `ServiceWorker`) as proposals like [Permissions Policy for Workers](https://github.com/explainers-by-googlers/workers-permissions-policy) mature?
 
 ---
 
@@ -216,28 +220,25 @@ We invite community feedback on several open design questions:
 | :--- | :--- | :--- |
 | **Autoregressive Prompt API (`LanguageModel`)** | Highly flexible; can generate arbitrary prose and explanations. | **10–100x slower and heavier** (requires multi-GB models); sequential token generation wastes energy when only a discrete decision or probability is needed; prone to uncalibrated probabilities. |
 | **Server-Side Decision APIs** | Access to massive frontier models; zero client download size. | **Privacy & data sovereignty risk** (sensitive DOM/user input leaves the device); network latency blocks real-time UI; recurring API costs for developers. |
-| **Bring-Your-Own Model (WebGPU / WASM + ONNX)** | Works today via libraries like Transformers.js (`open-jev`, `laya-ts`). | **Redundant downloads** (every origin downloads 300MB+ of weights); no cross-origin model caching or OS/browser-level hardware scheduling (LiteRT / XNNPACK / Accelerate). |
+| **Bring-Your-Own Model (WebGPU / WASM + ONNX)** | Works today via libraries like Transformers.js (`open-jev`, `laya-ts`); can pair with the [Cross-Origin Storage (COS)](https://github.com/WICG/cross-origin-storage) proposal to deduplicate identical weight files across origins. | **Fragmented downloads & storage overhead:** Even with [Cross-Origin Storage](https://github.com/WICG/cross-origin-storage), users still face redundant 300MB+ downloads and disk usage unless the web ecosystem converges on a tiny, standardized set of exact model checkpoints and quantizations; also lacks browser-managed hardware/OS scheduling (LiteRT / XNNPACK / Accelerate). |
 | **Fixed-Taxonomy-Only Classifier API** | Tiny footprint; stable numeric IDs for a single schema (e.g., IAB). | **Too narrow** for most app-specific routing, verification, scoring, and UI adaptation tasks where developers must define their own domain options. |
 
 ---
 
 ## Appendix B: Security, Privacy, Accessibility, i18n & Ecosystem Considerations
 
-- **Privacy & Data Sovereignty:** All inference executes locally on the user's device. The API is strictly **stateless**: inputs are never transmitted over the network, stored on disk, or used to update model weights across calls. Access is gated by `SecureContext` and the `classifier` Permissions Policy (`PermissionsPolicyFeature::kClassifier`, defaulting to `Self`).
+- **Privacy & Data Sovereignty:** All inference executes locally on the user's device. The API is strictly stateless: inputs are never transmitted over the network, stored on disk, or used to update model weights across calls. Access in `Window` contexts is gated by `SecureContext` and the `classifier` Permissions Policy (`PermissionsPolicyFeature::kClassifier`, defaulting to `Self`).
 - **Security & Injection Resistance:** User-supplied `input` text is strictly separated from developer-supplied `questions` and `options` during schema compilation, preventing untrusted input from injecting fake options or corrupting adjacent decision slots. Hardware timing and floating-point precision variations must be bounded to prevent device fingerprinting.
-- **Accessibility (a11y):** Fast local classification enables cognitive accessibility tools—such as automated tab grouping, reading-level estimation, and real-time form guidance—while calibrated `confidence` metrics allow UIs to avoid jarring automatic actions when user intent is uncertain.
-- **Internationalization (i18n):** Browsers must ensure equitable behavior across languages and scripts. If a language is unsupported by the active on-device checkpoint, the API must explicitly report unavailability (`Classifier.availability()`) or route to a multilingual checkpoint rather than returning uncalibrated guesses.
-- **Ecosystem Effects & Device Equitability:** Unlike 4B–8B generative LLMs that require high-end desktop GPUs, non-autoregressive decision architectures (such as 300M–420M ModernBERT/mmBERT with RLCD heads) run in tens of milliseconds via native CPU/NPU acceleration (LiteRT/XNNPACK/BLAS) and modest WebGPU hardware—bringing on-device AI to a wide global distribution of devices without exhausting RAM or battery.
+- **Accessibility (a11y):** While the API has no built-in UI, websites can use fast local classification to make their content and controls much easier to navigate, such as matching everyday phrasing or voice commands to site actions (even when a user doesn't know the exact button label), surfacing the most likely next steps so keyboard or switch users don't have to tab through dozens of elements, and flagging dense text to offer simpler summaries or form guidance.
+- **Internationalization (i18n):** Browsers must ensure equitable behavior across languages and scripts via `expectedInputs` (e.g., `[{ type: "text", languages: [...] }]`) in `Classifier.availability()` and `Classifier.create()`. If a requested language is unsupported by the active on-device checkpoint, the API must explicitly report `"unavailable"` or route to a multilingual checkpoint rather than returning uncalibrated guesses.
+- **Ecosystem Effects & Device Equitability:** Non-autoregressive decision architectures bring valuable on-device AI capabilities to a much broader range of devices than language model counterparts, without straining memory, compute, or battery. Model sizes tend to be much smaller (e.g. 300MB–800MB) and offer consistently fast performance (e.g. tens of milliseconds on modest consumer hardware).
 
 ---
 
 ## References & Prior Art
 
-- **System One Models & Jev:** [Introducing System One Models & Jev (TypeSafe AI)](https://typesafe.ai/blog/introducing-system-one-models-and-jev) & [Nikolas Martin's Overview](https://www.linkedin.com/posts/nicodotdev_everyone-in-my-timeline-is-talking-about-ugcPost-7507689872749527040--K05/)
+- **System One Models & Jev:** [Introducing System One Models & Jev (TypeSafe AI)](https://typesafe.ai/blog/introducing-system-one-models-and-jev)
 - **Open Implementations & Browser Runtimes:**
   - [Laya: Multilingual Non-Autoregressive System 1 Decision Engine](https://github.com/NandhaKishorM/laya)
   - [Open-Jev: Browser-Focused TypeScript Library for Typed Decisions](https://github.com/nico-martin/open-jev)
   - [Kev: Open Jev-like Decision Models on Qwen3/3.5](https://github.com/jaredpalmer/kev) & [kev-0.6b-ONNX on Hugging Face](https://huggingface.co/onnx-community/kev-0.6b-ONNX)
-- **Web Standards & Explainer Guidelines:**
-  - [W3C TAG: Writing Effective Explainers](https://www.w3.org/TR/explainer-explainer/)
-  - [Web Platform Design Principles](https://www.w3.org/TR/design-principles/)
